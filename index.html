@@ -13,6 +13,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="Agenda">
+<script src="https://accounts.google.com/gsi/client" async defer></script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 :root{
@@ -370,8 +371,27 @@ body{font-family:var(--font-sans);background:var(--color-background-tertiary);co
         </div>
         <button class="btn-save" style="width:100%" onclick="saveGeneralSettings()">Guardar ajustes</button>
         <p style="font-size:11px;color:var(--color-text-secondary);margin-top:10px">
-          Las alertas funcionan mientras la app esté abierta o instalada en tu celular. En iPhone, agregá la app a la pantalla de inicio (Compartir → Agregar a inicio) para que las notificaciones lleguen de forma más confiable.
+          Estas notificaciones del navegador solo suenan si la app está abierta o recién la reabriste. Para alertas puntuales aunque el celular esté bloqueado, conectá Google Calendar abajo.
         </p>
+      </div>
+      <div class="settings-group">
+        <div class="settings-group-title">Google Calendar (alertas puntuales)</div>
+        <p style="font-size:12px;color:var(--color-text-secondary);margin-bottom:10px">
+          Al conectar, tus tareas, tu turno y el recordatorio matutino se sincronizan como eventos en tu Google Calendar. La app de Calendar del celular dispara la alerta a horario exacto, aunque esta agenda esté cerrada.
+        </p>
+        <div class="settings-row">
+          <div>
+            <div class="settings-row-label">Estado</div>
+            <div class="settings-row-sub" id="gcal-status">No conectado</div>
+          </div>
+          <button class="link-btn" id="gcal-disconnect-btn" style="display:none" onclick="disconnectGoogle()">Desconectar</button>
+        </div>
+        <div class="form-group" style="margin-top:10px">
+          <label class="form-label">Client ID de Google Cloud</label>
+          <input class="form-input" id="google-client-id" placeholder="xxxxx.apps.googleusercontent.com">
+        </div>
+        <button class="btn-save" style="width:100%" onclick="connectGoogle()">Conectar Google Calendar</button>
+        <button class="btn-cancel" style="width:100%;margin-top:8px;display:none" id="gcal-resync-btn" onclick="syncAllToGoogle()">🔄 Sincronizar todo ahora</button>
       </div>
       <div class="settings-group">
         <div class="settings-group-title">Datos</div>
@@ -516,7 +536,7 @@ function defaultState(){
     objectives: {},
     work: {
       rateByYear: {},
-      turno: {name:'Turno mañana', start:'09:00', end:'17:00', days:[1,2,3,4,5]},
+      turno: {name:'Turno mañana', start:'09:00', end:'17:00', days:[1,2,3,4,5], gcalEventId:null},
       autoStart: true,
       autoEnd: true,
       _lastAutoStartDate: null,
@@ -529,6 +549,9 @@ function defaultState(){
       lastMorningNotifyDate: null,
       defaultRemind: 15,
       dolar: {venta:null, compra:null, updated:null, manual:false},
+      googleClientId: '',
+      googleConnected: false,
+      morningGcalEventId: null,
     },
     nextTaskId: 4,
     nextSessionId: 1,
@@ -548,9 +571,14 @@ function initState(){
   if(!state.settings) state.settings = defaultState().settings;
   if(!state.settings.dolar) state.settings.dolar = {venta:null,compra:null,updated:null,manual:false};
   if(state.settings.defaultRemind == null) state.settings.defaultRemind = 15;
+  if(state.settings.googleClientId == null) state.settings.googleClientId = '';
+  if(state.settings.googleConnected == null) state.settings.googleConnected = false;
+  if(state.settings.morningGcalEventId === undefined) state.settings.morningGcalEventId = null;
+  if(state.work.turno.gcalEventId === undefined) state.work.turno.gcalEventId = null;
   if(!state.objectives) state.objectives = {};
   if(!state.sessions) state.sessions = [];
   if(!state.tasks) state.tasks = [];
+  state.tasks.forEach(t => { if(t.gcalEventId === undefined) t.gcalEventId = null; });
   saveState();
 }
 
@@ -769,6 +797,7 @@ function saveWorkConfig(){
   saveState();
   renderWork(); renderToday();
   toast('Configuración guardada ✅');
+  syncTurnoToGoogle();
 }
 async function fetchDolar(){
   toast('Actualizando cotización…');
@@ -926,29 +955,36 @@ function saveTask(){
   const priority = document.getElementById('task-priority').value;
   const remind = Number(document.getElementById('task-remind').value);
   const notes = document.getElementById('task-notes').value.trim();
+  let savedTask;
   if(editingTaskId){
     const t = state.tasks.find(x => x.id === editingTaskId);
     Object.assign(t, {title, date, time, priority, remind, notes, notified:false});
+    savedTask = t;
   } else {
-    state.tasks.push({id: state.nextTaskId++, title, date, time, priority, remind, notes, done:false, notified:false});
+    savedTask = {id: state.nextTaskId++, title, date, time, priority, remind, notes, done:false, notified:false, gcalEventId:null};
+    state.tasks.push(savedTask);
   }
   saveState();
   closeModal('task');
   renderAll();
+  syncTaskToGoogle(savedTask);
 }
 function toggleTaskDone(id){
   const t = state.tasks.find(x => x.id === id);
   if(!t) return;
   t.done = !t.done;
   saveState(); renderAll();
+  if(t.done) deleteTaskFromGoogle(t); else syncTaskToGoogle(t);
 }
 function deleteTaskFromModal(){
   if(!editingTaskId) return;
   if(!confirm('¿Eliminar esta tarea?')) return;
+  const t = state.tasks.find(x => x.id === editingTaskId);
   state.tasks = state.tasks.filter(t => t.id !== editingTaskId);
   saveState();
   closeModal('task');
   renderAll();
+  if(t) deleteTaskFromGoogle(t);
 }
 function renderAll(){
   renderToday();
@@ -1017,6 +1053,11 @@ function renderSettings(){
   document.getElementById('notif-btn').style.display = (perm === 'granted' || perm === 'no-soportado') ? 'none' : 'inline-block';
   document.getElementById('morning-time').value = s.morningReminderTime;
   document.getElementById('default-remind').value = s.defaultRemind;
+  document.getElementById('google-client-id').value = s.googleClientId || '';
+  const connected = s.googleConnected && gcalAccessToken;
+  document.getElementById('gcal-status').textContent = connected ? 'Conectado ✅' : (s.googleConnected ? 'Reconectá (sesión expirada)' : 'No conectado');
+  document.getElementById('gcal-disconnect-btn').style.display = s.googleConnected ? 'inline-block' : 'none';
+  document.getElementById('gcal-resync-btn').style.display = s.googleConnected ? 'block' : 'none';
 }
 function saveGeneralSettings(){
   state.settings.morningReminderTime = document.getElementById('morning-time').value || '08:00';
@@ -1024,11 +1065,168 @@ function saveGeneralSettings(){
   state.settings.lastMorningNotifyDate = null;
   saveState();
   toast('Ajustes guardados ✅');
+  syncMorningToGoogle();
 }
 function clearAllData(){
   if(!confirm('¿Borrar todos los datos de la agenda? Esta acción no se puede deshacer.')) return;
   localStorage.removeItem(STORAGE_KEY);
   location.reload();
+}
+
+/* ══════════════ GOOGLE CALENDAR (alertas puntuales) ══════════════ */
+const GCAL_TZ = 'America/Argentina/Buenos_Aires';
+let gcalTokenClient = null;
+let gcalAccessToken = null;
+let gcalTokenExpiry = 0;
+
+function addMinutesToTime(hm, mins){
+  const [h,m] = hm.split(':').map(Number);
+  let total = h*60 + m + mins;
+  total = ((total % 1440) + 1440) % 1440;
+  return pad(Math.floor(total/60)) + ':' + pad(total%60);
+}
+function turnoRRuleByday(days){
+  const map = {0:'SU',1:'MO',2:'TU',3:'WE',4:'TH',5:'FR',6:'SA'};
+  return days.map(d => map[d]).join(',');
+}
+function nextDateForDow(dow, fromISO){
+  let d = new Date(fromISO+'T00:00:00');
+  for(let i=0; i<7; i++){ if(d.getDay() === dow) return isoFromDate(d); d.setDate(d.getDate()+1); }
+  return fromISO;
+}
+function initGoogleClient(){
+  const clientId = state.settings.googleClientId;
+  if(!clientId || !window.google || !google.accounts || !google.accounts.oauth2) return false;
+  if(!gcalTokenClient){
+    gcalTokenClient = google.accounts.oauth2.initTokenClient({
+      client_id: clientId,
+      scope: 'https://www.googleapis.com/auth/calendar.events',
+      callback: () => {},
+    });
+  }
+  return true;
+}
+function connectGoogle(){
+  const clientId = document.getElementById('google-client-id').value.trim();
+  if(!clientId){ toast('Pegá tu Client ID de Google primero.'); return; }
+  state.settings.googleClientId = clientId;
+  gcalTokenClient = null;
+  saveState();
+  if(!initGoogleClient()){ toast('No se pudo inicializar Google. Recargá la página e intentá de nuevo.'); return; }
+  gcalTokenClient.callback = (resp) => {
+    if(resp.error){ toast('No se pudo conectar con Google Calendar.'); return; }
+    gcalAccessToken = resp.access_token;
+    gcalTokenExpiry = Date.now() + (resp.expires_in*1000 - 60000);
+    state.settings.googleConnected = true;
+    saveState();
+    renderSettings();
+    toast('Google Calendar conectado ✅ Sincronizando…');
+    syncAllToGoogle();
+  };
+  gcalTokenClient.requestAccessToken({prompt:'consent'});
+}
+function disconnectGoogle(){
+  gcalAccessToken = null; gcalTokenExpiry = 0;
+  state.settings.googleConnected = false;
+  saveState(); renderSettings();
+  toast('Google Calendar desconectado.');
+}
+function ensureGoogleToken(){
+  if(gcalAccessToken && Date.now() < gcalTokenExpiry) return Promise.resolve(true);
+  if(!state.settings.googleClientId || !state.settings.googleConnected) return Promise.resolve(false);
+  if(!initGoogleClient()) return Promise.resolve(false);
+  return new Promise(resolve => {
+    try{
+      gcalTokenClient.callback = (resp) => {
+        if(resp.error){ resolve(false); return; }
+        gcalAccessToken = resp.access_token;
+        gcalTokenExpiry = Date.now() + (resp.expires_in*1000 - 60000);
+        resolve(true);
+      };
+      gcalTokenClient.requestAccessToken({prompt:''});
+    }catch(e){ resolve(false); }
+  });
+}
+async function gcalRequest(method, path, body){
+  const ok = await ensureGoogleToken();
+  if(!ok) return null;
+  try{
+    const res = await fetch(`https://www.googleapis.com/calendar/v3/calendars/primary/${path}`, {
+      method,
+      headers: {'Authorization':'Bearer '+gcalAccessToken, 'Content-Type':'application/json'},
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    if(res.status === 401){ gcalAccessToken = null; return null; }
+    if(res.status === 204) return {};
+    if(!res.ok) return null;
+    return await res.json();
+  }catch(e){ return null; }
+}
+async function syncTaskToGoogle(task){
+  if(!state.settings.googleClientId || !state.settings.googleConnected) return;
+  if(!task.date || !task.time){
+    if(task.gcalEventId){ await gcalRequest('DELETE', 'events/'+task.gcalEventId); task.gcalEventId = null; saveState(); }
+    return;
+  }
+  const remindMin = (task.remind != null) ? task.remind : state.settings.defaultRemind;
+  const endTime = addMinutesToTime(task.time, 30);
+  const body = {
+    summary: '📋 '+task.title,
+    description: task.notes || '',
+    start: {dateTime: `${task.date}T${task.time}:00`, timeZone: GCAL_TZ},
+    end: {dateTime: `${task.date}T${endTime}:00`, timeZone: GCAL_TZ},
+    reminders: {useDefault:false, overrides:[{method:'popup', minutes:remindMin}]},
+  };
+  let result = task.gcalEventId ? await gcalRequest('PATCH', 'events/'+task.gcalEventId, body) : null;
+  if(!result){
+    result = await gcalRequest('POST', 'events', body);
+    if(result && result.id) task.gcalEventId = result.id;
+  }
+  saveState();
+}
+async function deleteTaskFromGoogle(task){
+  if(task && task.gcalEventId){ await gcalRequest('DELETE', 'events/'+task.gcalEventId); task.gcalEventId = null; saveState(); }
+}
+async function syncTurnoToGoogle(){
+  if(!state.settings.googleClientId || !state.settings.googleConnected) return;
+  const w = state.work;
+  if(w.turno.gcalEventId){ await gcalRequest('DELETE', 'events/'+w.turno.gcalEventId); w.turno.gcalEventId = null; saveState(); }
+  if(!w.turno.days.length) return;
+  const anchor = nextDateForDow(w.turno.days[0], todayISO());
+  const body = {
+    summary: '🕒 '+w.turno.name,
+    start: {dateTime: `${anchor}T${w.turno.start}:00`, timeZone: GCAL_TZ},
+    end: {dateTime: `${anchor}T${w.turno.end}:00`, timeZone: GCAL_TZ},
+    recurrence: [`RRULE:FREQ=WEEKLY;BYDAY=${turnoRRuleByday(w.turno.days)}`],
+    reminders: {useDefault:false, overrides:[{method:'popup', minutes:0}]},
+  };
+  const result = await gcalRequest('POST', 'events', body);
+  if(result && result.id) w.turno.gcalEventId = result.id;
+  saveState();
+}
+async function syncMorningToGoogle(){
+  if(!state.settings.googleClientId || !state.settings.googleConnected) return;
+  const s = state.settings;
+  if(s.morningGcalEventId){ await gcalRequest('DELETE', 'events/'+s.morningGcalEventId); s.morningGcalEventId = null; saveState(); }
+  const end = addMinutesToTime(s.morningReminderTime, 15);
+  const body = {
+    summary: '☀️ Planificar el día',
+    description: 'Revisá tus tareas y tus 3 objetivos: productividad, eficiencia, eficacia.',
+    start: {dateTime: `${todayISO()}T${s.morningReminderTime}:00`, timeZone: GCAL_TZ},
+    end: {dateTime: `${todayISO()}T${end}:00`, timeZone: GCAL_TZ},
+    recurrence: ['RRULE:FREQ=DAILY'],
+    reminders: {useDefault:false, overrides:[{method:'popup', minutes:0}]},
+  };
+  const result = await gcalRequest('POST', 'events', body);
+  if(result && result.id) s.morningGcalEventId = result.id;
+  saveState();
+}
+async function syncAllToGoogle(){
+  if(!state.settings.googleClientId || !state.settings.googleConnected) return;
+  await syncTurnoToGoogle();
+  await syncMorningToGoogle();
+  for(const t of state.tasks){ if(!t.done) await syncTaskToGoogle(t); }
+  toast('Sincronizado con Google Calendar ✅');
 }
 
 /* ══════════════ INIT ══════════════ */
